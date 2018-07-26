@@ -33,6 +33,11 @@ _SUBNET_DATA = {'network_id': _NET_ID}
 _PORT_ID = 'PORT_ID'
 _PORT_DATA = {'network_id': _NET_ID,
               'fixed_ips': [{'subnet_id': _SUBNET_ID}]}
+_PORT_DATA_DUPLICATE_SUBNET = {
+    'network_id': _NET_ID,
+    'fixed_ips': [{'subnet_id': _SUBNET_ID},
+                  {'subnet_id': _SUBNET_ID}]
+}
 _ROUTER_ID = 'ROUTER_ID'
 _ROUTER_DATA = {'id': 'ROUTER_ID',
                 'gw_port_id': 'GW_PORT_ID'}
@@ -48,47 +53,58 @@ _TRUNK_DATA = {'trunk_id': _TRUNK_ID,
                'port_id': _PORT_ID,
                'sub_ports': [{'port_id': _SUBPORT_ID}]}
 _BGPVPN_ID = 'BGPVPN_ID'
+_SG_ID = 'SG_ID'
+_SG_DATA = {'id': _SG_ID}
+_SG_RULE_ID = 'SG_RULE_ID'
+_SG_RULE_DATA = {'id': _SG_RULE_ID,
+                 'security_group_id': _SG_ID}
 
 
 def get_data(res_type, operation):
     if res_type == const.ODL_NETWORK:
-        return _NET_DATA
+        return [_NET_DATA]
     elif res_type == const.ODL_SUBNET:
         if operation == const.ODL_DELETE:
-            return [_NET_ID]
-        return _SUBNET_DATA
+            return [[_NET_ID]]
+        return [_SUBNET_DATA]
     elif res_type == const.ODL_PORT:
         # TODO(yamahata): test case of (ODL_port, ODL_DELETE) is missing
         if operation == const.ODL_DELETE:
-            return [_NET_ID, _SUBNET_ID]
-        return _PORT_DATA
+            return [[_NET_ID, _SUBNET_ID]]
+        return [_PORT_DATA, _PORT_DATA_DUPLICATE_SUBNET]
     elif res_type == const.ODL_ROUTER:
-        return _ROUTER_DATA
+        return [_ROUTER_DATA]
     elif res_type == const.ODL_L2GATEWAY:
-        return _L2GW_DATA
+        return [_L2GW_DATA]
     elif res_type == const.ODL_L2GATEWAY_CONNECTION:
-        return _L2GWCONN_DATA
+        return [_L2GWCONN_DATA]
     elif res_type == const.ODL_TRUNK:
         if operation == const.ODL_DELETE:
-            return [_PORT_ID, _SUBPORT_ID]
-        return _TRUNK_DATA
+            return [[_PORT_ID, _SUBPORT_ID]]
+        return [_TRUNK_DATA]
     elif res_type == const.ODL_BGPVPN:
         if operation == const.ODL_DELETE:
-            return [_NET_ID, _ROUTER_ID]
+            return [[_NET_ID, _ROUTER_ID]]
         else:
             routers = []
             networks = []
             if operation == const.ODL_UPDATE:
                 routers = [_ROUTER_ID]
                 networks = [_NET_ID]
-            return {'id': _BGPVPN_ID, 'networks': networks,
-                    'routers': routers,
-                    'route_distinguishers': ['100:1']}
-    return []
+            return [{'id': _BGPVPN_ID, 'networks': networks,
+                     'routers': routers,
+                     'route_distinguishers': ['100:1']}]
+    elif res_type == const.ODL_SG:
+        return [_SG_DATA]
+    elif res_type == const.ODL_SG_RULE:
+        if operation == const.ODL_DELETE:
+            return [[_SG_RULE_ID]]
+        return [_SG_RULE_DATA]
+    return [[]]
 
 
 def subnet_fail_network_dep(net_op, subnet_op):
-    return {'expected': True,
+    return {'expected': 1,
             'first_type': const.ODL_NETWORK,
             'first_operation': net_op,
             'first_id': _NET_ID,
@@ -98,7 +114,7 @@ def subnet_fail_network_dep(net_op, subnet_op):
 
 
 def subnet_succeed_network_dep(net_op, subnet_op):
-    return {'expected': False,
+    return {'expected': 0,
             'first_type': const.ODL_SUBNET,
             'first_operation': subnet_op,
             'first_id': _SUBNET_ID,
@@ -114,10 +130,11 @@ class BaseDependencyValidationsTestCase(object):
             self.db_session, self.first_type, self.first_id,
             self.first_operation,
             get_data(self.first_type, self.first_operation))
-        deps = dependency_validations.calculate(
-            self.db_session, self.second_operation, self.second_type,
-            self.second_id, get_data(self.second_type, self.second_operation))
-        self.assertEqual(self.expected, len(deps) != 0)
+        for data in get_data(self.second_type, self.second_operation):
+            deps = dependency_validations.calculate(
+                self.db_session, self.second_operation, self.second_type,
+                self.second_id, data)
+            self.assertEqual(self.expected, len(deps))
 
 
 class SubnetDependencyValidationsTestCase(
@@ -158,8 +175,82 @@ class SubnetDependencyValidationsTestCase(
     )
 
 
+def security_rule_fail_security_group_dep(sg_op, sgr_op):
+    return {'expected': 1,
+            'first_type': const.ODL_SG,
+            'first_operation': sg_op,
+            'first_id': _SG_ID,
+            'second_type': const.ODL_SG_RULE,
+            'second_operation': sgr_op,
+            'second_id': _SG_RULE_ID}
+
+
+def security_rule_succeed_security_group_dep(sg_op, sgr_op):
+    return {'expected': 0,
+            'first_type': const.ODL_SG_RULE,
+            'first_operation': sgr_op,
+            'first_id': _SG_RULE_ID,
+            'second_type': const.ODL_SG,
+            'second_operation': sg_op,
+            'second_id': _SG_ID}
+
+
+class SecurityRuleDependencyValidationsTestCase(
+        test_base_db.ODLBaseDbTestCase, BaseDependencyValidationsTestCase):
+    scenarios = (
+        ("security_rule_create_depends_on_older_security_group_create",
+         security_rule_fail_security_group_dep(const.ODL_CREATE,
+                                               const.ODL_CREATE)),
+        ("security_rule_create_depends_on_older_security_group_update",
+         security_rule_fail_security_group_dep(const.ODL_UPDATE,
+                                               const.ODL_CREATE)),
+        ("security_rule_create_depends_on_older_security_group_delete",
+         security_rule_fail_security_group_dep(const.ODL_DELETE,
+                                               const.ODL_CREATE)),
+        ("security_rule_create_doesnt_depend_on_newer_security_group_create",
+         security_rule_succeed_security_group_dep(const.ODL_CREATE,
+                                                  const.ODL_CREATE)),
+        ("security_rule_create_doesnt_depend_on_newer_security_group_update",
+         security_rule_succeed_security_group_dep(const.ODL_UPDATE,
+                                                  const.ODL_CREATE)),
+        ("security_rule_create_doesnt_depend_on_newer_security_group_delete",
+         security_rule_succeed_security_group_dep(const.ODL_DELETE,
+                                                  const.ODL_CREATE)),
+        ("security_rule_update_depends_on_older_security_group_create",
+         security_rule_fail_security_group_dep(const.ODL_CREATE,
+                                               const.ODL_UPDATE)),
+        ("security_rule_update_depends_on_older_security_group_update",
+         security_rule_fail_security_group_dep(const.ODL_UPDATE,
+                                               const.ODL_UPDATE)),
+        ("security_rule_update_depends_on_older_security_group_delete",
+         security_rule_fail_security_group_dep(const.ODL_DELETE,
+                                               const.ODL_UPDATE)),
+        ("security_rule_update_doesnt_depend_on_newer_security_group_create",
+         security_rule_succeed_security_group_dep(const.ODL_CREATE,
+                                                  const.ODL_UPDATE)),
+        ("security_rule_update_doesnt_depend_on_newer_security_group_update",
+         security_rule_succeed_security_group_dep(const.ODL_UPDATE,
+                                                  const.ODL_UPDATE)),
+        ("security_rule_update_doesnt_depend_on_newer_security_group_delete",
+         security_rule_succeed_security_group_dep(const.ODL_DELETE,
+                                                  const.ODL_UPDATE)),
+        ("security_rule_delete_doesnt_depend_on_older_security_group_create",
+         security_rule_succeed_security_group_dep(const.ODL_CREATE,
+                                                  const.ODL_DELETE)),
+        ("security_rule_delete_doesnt_depend_on_older_security_group_update",
+         security_rule_succeed_security_group_dep(const.ODL_UPDATE,
+                                                  const.ODL_DELETE)),
+        ("security_rule_delete_doesnt_depend_on_newer_security_group_create",
+         security_rule_succeed_security_group_dep(const.ODL_CREATE,
+                                                  const.ODL_DELETE)),
+        ("security_rule_delete_doesnt_depend_on_newer_security_group_update",
+         security_rule_succeed_security_group_dep(const.ODL_UPDATE,
+                                                  const.ODL_DELETE)),
+    )
+
+
 def port_fail_network_dep(net_op, port_op):
-    return {'expected': True,
+    return {'expected': 1,
             'first_type': const.ODL_NETWORK,
             'first_operation': net_op,
             'first_id': _NET_ID,
@@ -169,7 +260,7 @@ def port_fail_network_dep(net_op, port_op):
 
 
 def port_succeed_network_dep(net_op, port_op):
-    return {'expected': False,
+    return {'expected': 0,
             'first_type': const.ODL_PORT,
             'first_operation': port_op,
             'first_id': _PORT_ID,
@@ -179,7 +270,7 @@ def port_succeed_network_dep(net_op, port_op):
 
 
 def port_fail_subnet_dep(subnet_op, port_op):
-    return {'expected': True,
+    return {'expected': 1,
             'first_type': const.ODL_SUBNET,
             'first_operation': subnet_op,
             'first_id': _SUBNET_ID,
@@ -189,7 +280,7 @@ def port_fail_subnet_dep(subnet_op, port_op):
 
 
 def port_succeed_subnet_dep(subnet_op, port_op):
-    return {'expected': False,
+    return {'expected': 0,
             'first_type': const.ODL_PORT,
             'first_operation': port_op,
             'first_id': _PORT_ID,
@@ -254,7 +345,7 @@ class PortDependencyValidationsTestCase(
 
 def trunk_dep(first_type, second_type, first_op, second_op, result,
               sub_port=False):
-    expected = {'fail': True, 'pass': False}
+    expected = {'fail': 1, 'pass': 0}
     port_id = _SUBPORT_ID if sub_port else _PORT_ID
     type_id = {const.ODL_PORT: port_id,
                const.ODL_TRUNK: _TRUNK_ID}
@@ -313,7 +404,7 @@ class TrunkDependencyValidationsTestCase(
 
 
 def l2gw_dep(first_type, second_type, first_op, second_op, result):
-    expected = {'fail': True, 'pass': False}
+    expected = {'fail': 1, 'pass': 0}
     type_id = {const.ODL_NETWORK: _NET_ID,
                const.ODL_L2GATEWAY: _L2GW_ID,
                const.ODL_L2GATEWAY_CONNECTION: _L2GWCONN_ID}
@@ -346,7 +437,7 @@ class L2GWDependencyValidationsTestCase(
 
 # TODO(vthapar): Refactor *_dep into a common method
 def bgpvpn_dep(first_type, second_type, first_op, second_op, result):
-    expected = {'fail': True, 'pass': False}
+    expected = {'fail': 1, 'pass': 0}
     type_id = {const.ODL_NETWORK: _NET_ID,
                const.ODL_ROUTER: _ROUTER_ID,
                const.ODL_BGPVPN: _BGPVPN_ID}

@@ -74,8 +74,8 @@ ODL_BGPVPN = 'bgpvpn'
 ODL_BGPVPNS = 'bgpvpns'
 ODL_BGPVPN_NETWORK_ASSOCIATION = 'bgpvpn_network_association'
 ODL_BGPVPN_NETWORK_ASSOCIATIONS = 'bgpvpn_network_associations'
-ODL_BGPVPN_ROUTER_ASSOCIATION = 'bgpvpn_network_association'
-ODL_BGPVPN_ROUTER_ASSOCIATIONS = 'bgpvpn_network_associations'
+ODL_BGPVPN_ROUTER_ASSOCIATION = 'bgpvpn_router_association'
+ODL_BGPVPN_ROUTER_ASSOCIATIONS = 'bgpvpn_router_associations'
 
 ODL_ML2_MECH_DRIVER_V1 = "opendaylight"
 ODL_ML2_MECH_DRIVER_V2 = "opendaylight_v2"
@@ -94,4 +94,10 @@ COMPLETED = 'completed'
 BEFORE_COMPLETE = 'before_complete'
 
 # dict to store url mappings
-RESOURCE_URL_MAPPINGS = {ODL_QOS_POLICY: "%s/%s" % (ODL_QOS, ODL_QOS_POLICIES)}
+RESOURCE_URL_MAPPINGS = {
+    ODL_QOS_POLICY: "%s/%s" % (ODL_QOS, ODL_QOS_POLICIES),
+    ODL_SFC_FLOW_CLASSIFIER: "%s/%s" % (ODL_SFC, ODL_SFC_FLOW_CLASSIFIERS),
+    ODL_SFC_PORT_CHAIN: "%s/%s" % (ODL_SFC, ODL_SFC_PORT_CHAINS),
+    ODL_SFC_PORT_PAIR: "%s/%s" % (ODL_SFC, ODL_SFC_PORT_PAIRS),
+    ODL_SFC_PORT_PAIR_GROUP: "%s/%s" % (ODL_SFC, ODL_SFC_PORT_PAIR_GROUPS)
+}

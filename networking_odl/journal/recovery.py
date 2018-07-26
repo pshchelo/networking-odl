@@ -14,6 +14,7 @@
 #  under the License.
 #
 
+from neutron.db import api as db_api
 from neutron_lib import exceptions as nexc
 from neutron_lib.plugins import directory
 from oslo_log import log as logging
@@ -34,20 +35,25 @@ class UnsupportedResourceType(Exception):
     pass
 
 
+@db_api.retry_if_session_inactive()
 def journal_recovery(context):
-    for row in db.get_all_db_rows_by_state(context.session, odl_const.FAILED):
+    for row in db.get_all_db_rows_by_state(context.session,
+                                           odl_const.FAILED):
+        LOG.debug("Attempting recovery of journal entry %s.", row)
         try:
-            LOG.debug("Attempting recovery of journal entry %s.", row)
-            odl_resource = _CLIENT.get_client().get_resource(row.object_type,
-                                                             row.object_uuid)
-            if odl_resource is not None:
-                _handle_existing_resource(context, row)
-            else:
-                _handle_non_existing_resource(context, row)
+            odl_resource = _CLIENT.get_client().get_resource(
+                row.object_type,
+                row.object_uuid)
         except UnsupportedResourceType:
             LOG.warning('Unsupported resource %s', row.object_type)
         except Exception:
             LOG.exception("Failure while recovering journal entry %s.", row)
+        else:
+            with db_api.autonested_transaction(context.session):
+                if odl_resource is not None:
+                    _handle_existing_resource(context, row)
+                else:
+                    _handle_non_existing_resource(context, row)
 
 
 def _get_latest_resource(context, row):
@@ -77,12 +83,12 @@ def _sync_resource_to_odl(context, row, operation_type, exists_on_odl):
         journal.record(context, row.object_type, row.object_uuid,
                        operation_type, resource)
 
-    db.update_db_row_state(context.session, row, odl_const.COMPLETED)
+    journal.entry_complete(context, row)
 
 
 def _handle_existing_resource(context, row):
     if row.operation == odl_const.ODL_CREATE:
-        db.update_db_row_state(context.session, row, odl_const.COMPLETED)
+        journal.entry_complete(context, row)
     elif row.operation == odl_const.ODL_DELETE:
         db.update_db_row_state(context.session, row, odl_const.PENDING)
     else:
@@ -91,7 +97,7 @@ def _handle_existing_resource(context, row):
 
 def _handle_non_existing_resource(context, row):
     if row.operation == odl_const.ODL_DELETE:
-        db.update_db_row_state(context.session, row, odl_const.COMPLETED)
+        journal.entry_complete(context, row)
     else:
         _sync_resource_to_odl(context, row, odl_const.ODL_CREATE, False)
         # TODO(mkolesni): Handle missing parent resources somehow.

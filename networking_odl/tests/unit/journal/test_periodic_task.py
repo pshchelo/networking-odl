@@ -18,6 +18,7 @@ import threading
 import time
 
 import mock
+from neutron.common import utils
 
 from networking_odl.common import constants as odl_const
 from networking_odl.db import db
@@ -26,16 +27,18 @@ from networking_odl.journal import periodic_task
 from networking_odl.tests.unit import test_base_db
 
 
+TEST_TASK_NAME = 'test-maintenance'
+
+
 class PeriodicTaskThreadTestCase(test_base_db.ODLBaseDbTestCase):
     def setUp(self):
         super(PeriodicTaskThreadTestCase, self).setUp()
-        row = models.OpenDaylightPeriodicTask(task='test-maintenance',
+        row = models.OpenDaylightPeriodicTask(task=TEST_TASK_NAME,
                                               state=odl_const.PENDING)
         self.db_session.add(row)
         self.db_session.flush()
 
-        self.thread = periodic_task.PeriodicTask('test-maintenance')
-        self.thread.interval = 0.01
+        self.thread = periodic_task.PeriodicTask(TEST_TASK_NAME, 0.01)
         self.addCleanup(self.thread.cleanup)
 
     def test__execute_op_no_exception(self):
@@ -57,6 +60,8 @@ class PeriodicTaskThreadTestCase(test_base_db.ODLBaseDbTestCase):
 
     def test_thread_works(self):
         callback_event = threading.Event()
+        # TODO(mpeterson): Make this an int when Py2 is no longer supported
+        # and use the `nonlocal` directive
         count = [0]
 
         def callback_op(**kwargs):
@@ -94,10 +99,9 @@ class PeriodicTaskThreadTestCase(test_base_db.ODLBaseDbTestCase):
         self.assertTrue(callback_event.wait(timeout=5))
 
     def test_multiple_thread_work(self):
-        self.thread1 = periodic_task.PeriodicTask('test-maintenance1')
+        self.thread1 = periodic_task.PeriodicTask('test-maintenance1', 0.01)
         callback_event = threading.Event()
         callback_event1 = threading.Event()
-        self.thread1.interval = 0.01
         self.addCleanup(self.thread1.cleanup)
 
         def callback_op(**kwargs):
@@ -128,8 +132,62 @@ class PeriodicTaskThreadTestCase(test_base_db.ODLBaseDbTestCase):
             mock_status_method.return_value = True
             self.thread.start()
             time.sleep(1)
-            mock_log_info.assert_called_with(msg, 'test-maintenance')
+            mock_log_info.assert_called_with(msg, TEST_TASK_NAME)
             self.assertFalse(callback_event.wait(timeout=1))
-            mock_log_info.assert_called_with(msg, 'test-maintenance')
+            mock_log_info.assert_called_with(msg, TEST_TASK_NAME)
             mock_status_method.return_value = False
             self.assertTrue(callback_event.wait(timeout=2))
+
+    def test_set_operation_retries_exceptions(self):
+        with mock.patch.object(db, 'update_periodic_task') as m:
+            self._test_retry_exceptions(self.thread._set_operation,
+                                        m, True)
+
+    def test_lock_task_retries_exceptions(self):
+        with mock.patch.object(db, 'lock_periodic_task') as m:
+            self._test_retry_exceptions(self.thread._lock_task,
+                                        m, True)
+
+    def test_clear_and_unlock_task_retries_exceptions(self):
+        with mock.patch.object(db, 'update_periodic_task') as m:
+            self._test_retry_exceptions(self.thread._clear_and_unlock_task,
+                                        m, True)
+
+    @mock.patch.object(db, "was_periodic_task_executed_recently",
+                       return_value=False)
+    def test_no_multiple_executions_simultaneously(self, mock_exec_recently):
+        continue_event = threading.Event()
+        trigger_event = threading.Event()
+        # TODO(mpeterson): Make this an int when Py2 is no longer supported
+        # and use the `nonlocal` directive
+        count = [0]
+
+        def wait_until_event(context):
+            trigger_event.set()
+            if continue_event.wait(2):
+                count[0] += 1
+
+        self.thread.register_operation(wait_until_event)
+
+        def task_locked():
+            row = (self.db_session.query(models.OpenDaylightPeriodicTask)
+                                  .filter_by(state=odl_const.PROCESSING,
+                                             task=TEST_TASK_NAME)
+                                  .one_or_none())
+            return (row is not None)
+
+        self.thread.start()
+        utils.wait_until_true(trigger_event.is_set, 5, 0.01)
+        self.assertEqual(count[0], 0)
+        self.assertTrue(task_locked())
+
+        self.thread.execute_ops()
+        self.assertEqual(count[0], 0)
+        self.assertTrue(task_locked())
+
+        continue_event.set()
+        trigger_event.clear()
+        utils.wait_until_true(trigger_event.is_set, 5, 0.01)
+        self.thread.cleanup()
+        self.assertFalse(task_locked())
+        self.assertGreaterEqual(count[0], 1)

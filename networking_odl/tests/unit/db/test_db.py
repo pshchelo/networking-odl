@@ -18,7 +18,7 @@ from datetime import timedelta
 
 import mock
 
-from sqlalchemy.orm import exc
+from neutron.db import api as db_api
 
 from networking_odl.common import constants as odl_const
 from networking_odl.db import db
@@ -27,12 +27,12 @@ from networking_odl.tests.unit import test_base_db
 
 
 class DbTestCase(test_base_db.ODLBaseDbTestCase):
-
-    UPDATE_ROW = [odl_const.ODL_NETWORK, 'id', odl_const.ODL_UPDATE,
-                  {'test': 'data'}]
-
     def setUp(self):
         super(DbTestCase, self).setUp()
+        # NOTE(mpeterson): Due to how the pecan lib does introspection
+        # to find a non-decorated function, it needs a function that will
+        # be found in the end. The line below workarounds this limitation.
+        self._mock_function = mock.MagicMock()
 
     def _update_row(self, row):
         self.db_session.merge(row)
@@ -65,18 +65,65 @@ class DbTestCase(test_base_db.ODLBaseDbTestCase):
         self.assertEqual(expected_state, row.state)
         self.assertEqual(expected_retry_count, row.retry_count)
 
-    def _test_update_row_state(self, from_state, to_state):
+    def _test_retry_wrapper(self, decorated_function, receives_context):
+        # NOTE(mpeterson): we want to make sure that it's configured
+        # to MAX_RETRIES.
+        self.assertEqual(db_api._retry_db_errors.max_retries,
+                         db_api.MAX_RETRIES)
+
+        self._test_retry_exceptions(decorated_function,
+                                    self._mock_function, receives_context,
+                                    False)
+
+    # NOTE(mpeterson): The following two functions serve to workaround a
+    # limitation in the discovery mechanism of pecan lib that does not allow
+    # us to create a generic function that decorates on the fly. It needs to
+    # be decorated through the decorator directive and not via function
+    # composition
+    @db_api.retry_if_session_inactive()
+    def _decorated_retry_if_session_inactive(self, context):
+        self._mock_function()
+
+    @db_api.retry_db_errors
+    def _decorated_retry_db_errors(self, context):
+        self._mock_function()
+
+    def test_retry_db_errors(self):
+        self._test_retry_wrapper(self._decorated_retry_db_errors,
+                                 False)
+
+    def test_retry_if_session_inactive(self):
+        self._test_retry_wrapper(self._decorated_retry_if_session_inactive,
+                                 True)
+
+    def _test_update_row_state(self, from_state, to_state, dry_flush=False):
         # add new pending row
         db.create_pending_row(self.db_session, *self.UPDATE_ROW)
 
+        mock_flush = mock.MagicMock(side_effect=self.db_session.flush)
+
+        if dry_flush:
+            patch_flush = mock.patch.object(self.db_session, 'flush',
+                                            side_effect=mock_flush)
+
         row = db.get_all_db_rows(self.db_session)[0]
         for state in [from_state, to_state]:
-            # update the row state
-            db.update_db_row_state(self.db_session, row, state)
+            if dry_flush:
+                patch_flush.start()
+
+            try:
+                # update the row state
+                db.update_db_row_state(self.db_session, row, state,
+                                       flush=not dry_flush)
+            finally:
+                if dry_flush:
+                    patch_flush.stop()
 
             # validate the new state
             row = db.get_all_db_rows(self.db_session)[0]
             self.assertEqual(state, row.state)
+
+        return mock_flush
 
     def test_updates_same_object_uuid(self):
         self._test_validate_updates(self.UPDATE_ROW, self.UPDATE_ROW, True)
@@ -134,19 +181,6 @@ class DbTestCase(test_base_db.ODLBaseDbTestCase):
         row = db.get_oldest_pending_db_row_with_lock(self.db_session)
         self.assertEqual(older_row, row)
 
-    def test_get_oldest_pending_row_when_conflict(self):
-        db.create_pending_row(self.db_session, *self.UPDATE_ROW)
-        update_mock = mock.MagicMock(
-            side_effect=(exc.StaleDataError, mock.DEFAULT))
-
-        # Mocking is mandatory to achieve a deadlock regardless of the DB
-        # backend being used when running the tests
-        with mock.patch.object(db, 'update_db_row_state', new=update_mock):
-            row = db.get_oldest_pending_db_row_with_lock(self.db_session)
-            self.assertIsNotNone(row)
-
-        self.assertEqual(2, update_mock.call_count)
-
     def _test_get_oldest_pending_row_with_dep(self, dep_state):
         db.create_pending_row(self.db_session, *self.UPDATE_ROW)
         parent_row = db.get_all_db_rows(self.db_session)[0]
@@ -179,19 +213,75 @@ class DbTestCase(test_base_db.ODLBaseDbTestCase):
         row = self._test_get_oldest_pending_row_with_dep(odl_const.PROCESSING)
         self.assertIsNone(row)
 
+    def test_get_oldest_pending_row_retries_exceptions(self):
+        with mock.patch.object(self.db_session, 'query') as m:
+            self._test_retry_exceptions(db.get_oldest_pending_db_row_with_lock,
+                                        m, False)
+
+    def _test_delete_row(self, by_row=False, by_row_id=False, dry_flush=False):
+        db.create_pending_row(self.db_session, *self.UPDATE_ROW)
+        db.create_pending_row(self.db_session, *self.UPDATE_ROW)
+
+        rows = db.get_all_db_rows(self.db_session)
+        self.assertEqual(len(rows), 2)
+        row = rows[-1]
+
+        params = {'flush': not dry_flush}
+        if by_row:
+            params['row'] = row
+        elif by_row_id:
+            params['row_id'] = row.seqnum
+
+        mock_flush = None
+        if dry_flush:
+            patch_flush = mock.patch.object(self.db_session, 'flush',
+                                            side_effect=self.db_session.flush)
+            mock_flush = patch_flush.start()
+
+        try:
+            db.delete_row(self.db_session, **params)
+        finally:
+            if dry_flush:
+                patch_flush.stop()
+                self.db_session.flush()
+
+        rows = db.get_all_db_rows(self.db_session)
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(row.seqnum, rows[0].seqnum)
+
+        return mock_flush
+
+    def test_delete_row_by_row(self):
+        self._test_delete_row(by_row=True)
+
+    def test_delete_row_by_row_id(self):
+        self._test_delete_row(by_row_id=True)
+
+    def test_delete_row_by_row_without_flushing(self):
+        mock_flush = self._test_delete_row(by_row=True, dry_flush=True)
+        mock_flush.assert_not_called()
+
+    def test_create_pending_row(self):
+        row = db.create_pending_row(self.db_session, *self.UPDATE_ROW)
+        self.assertIsNotNone(row)
+        rows = db.get_all_db_rows(self.db_session)
+        self.assertTrue(row in rows)
+
     def _test_delete_rows_by_state_and_time(self, last_retried, row_retention,
-                                            state, expected_rows):
+                                            state, expected_rows,
+                                            dry_delete=False):
         db.create_pending_row(self.db_session, *self.UPDATE_ROW)
 
         # update state and last retried
-        row = db.get_all_db_rows(self.db_session)[0]
+        row = db.get_all_db_rows(self.db_session)[-1]
         row.state = state
         row.last_retried = row.last_retried - timedelta(seconds=last_retried)
         self._update_row(row)
 
-        db.delete_rows_by_state_and_time(self.db_session,
-                                         odl_const.COMPLETED,
-                                         timedelta(seconds=row_retention))
+        if not dry_delete:
+            db.delete_rows_by_state_and_time(self.db_session,
+                                             odl_const.COMPLETED,
+                                             timedelta(seconds=row_retention))
 
         # validate the number of rows in the journal
         rows = db.get_all_db_rows(self.db_session)
@@ -205,6 +295,57 @@ class DbTestCase(test_base_db.ODLBaseDbTestCase):
 
     def test_delete_completed_rows_wrong_state(self):
         self._test_delete_rows_by_state_and_time(10, 8, odl_const.PENDING, 1)
+
+    def _test_reset_processing_rows(self, session, last_retried, max_timedelta,
+                                    quantity, dry_reset=False):
+        db.create_pending_row(self.db_session, *self.UPDATE_ROW)
+        expected_state = odl_const.PROCESSING
+
+        row = db.get_all_db_rows(self.db_session)[-1]
+        row.state = expected_state
+        row.last_retried = row.last_retried - timedelta(seconds=last_retried)
+        self._update_row(row)
+
+        if not dry_reset:
+            expected_state = odl_const.PENDING
+            reset = db.reset_processing_rows(self.db_session, max_timedelta)
+            self.assertIsInstance(reset, int)
+            self.assertEqual(reset, quantity)
+
+        rows = db.get_all_db_rows_by_state(self.db_session, expected_state)
+
+        self.assertEqual(len(rows), quantity)
+        for row in rows:
+            self.assertEqual(row.state, expected_state)
+
+    def test_reset_processing_rows(self):
+        self._test_reset_processing_rows(self.db_session, 6, 5, 1)
+
+    def test_reset_processing_rows_no_new_rows(self):
+        self._test_reset_processing_rows(self.db_session, 0, 10, 0)
+
+    @mock.patch.object(db, 'update_db_row_state',
+                       side_effect=db.update_db_row_state)
+    def test_reset_processing_rows_individually(self, mock_update_row):
+        self._test_reset_processing_rows(self.db_session, 6, 5, 1, True)
+        self._test_reset_processing_rows(self.db_session, 6, 5, 2)
+        self.assertEqual(mock_update_row.call_count, 2)
+        self.assertEqual(mock_update_row.call_args[1], {'flush': False})
+
+    def test_delete_completed_rows_individually(self):
+        self._test_delete_rows_by_state_and_time(6, 5, odl_const.COMPLETED, 1,
+                                                 True)
+        patch_delete = mock.patch.object(self.db_session, 'delete',
+                                         side_effect=self.db_session.delete)
+        mock_delete = patch_delete.start()
+        self.addCleanup(patch_delete.stop)
+        self._test_delete_rows_by_state_and_time(6, 5, odl_const.COMPLETED, 0)
+        self.assertEqual(mock_delete.call_count, 2)
+
+    @mock.patch.object(db, 'delete_row', side_effect=db.delete_row)
+    def test_delete_completed_rows_without_flush(self, mock_delete_row):
+        self._test_delete_rows_by_state_and_time(6, 5, odl_const.COMPLETED, 0)
+        self.assertEqual({'flush': False}, mock_delete_row.call_args[1])
 
     def test_valid_retry_count(self):
         self._test_retry_count(1, 1, 1, odl_const.PENDING)
@@ -223,6 +364,14 @@ class DbTestCase(test_base_db.ODLBaseDbTestCase):
 
     def test_update_row_state_to_completed(self):
         self._test_update_row_state(odl_const.PROCESSING, odl_const.COMPLETED)
+
+    def test_update_row_state_to_status_without_flush(self):
+        mock_flush = self._test_update_row_state(odl_const.PROCESSING,
+                                                 odl_const.COMPLETED,
+                                                 dry_flush=True)
+        # NOTE(mpeterson): call_count=2 because session.merge() calls flush()
+        # and we are changing the status twice
+        self.assertEqual(mock_flush.call_count, 2)
 
     def _test_periodic_task_lock_unlock(self, db_func, existing_state,
                                         expected_state, expected_result,

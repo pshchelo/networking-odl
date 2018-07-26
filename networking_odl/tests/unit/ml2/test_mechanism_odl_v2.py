@@ -57,9 +57,10 @@ SG_RULE_FAKE_ID = uuidutils.generate_uuid()
 
 class OpenDayLightMechanismConfigTests(testlib_api.SqlTestCase):
     def setUp(self):
-        super(OpenDayLightMechanismConfigTests, self).setUp()
         self.useFixture(base.OpenDaylightFeaturesFixture())
         self.useFixture(base.OpenDaylightJournalThreadFixture())
+        self.useFixture(base.OpenDaylightPseudoAgentPrePopulateFixture())
+        super(OpenDayLightMechanismConfigTests, self).setUp()
         cfg.CONF.set_override('mechanism_drivers',
                               ['logger', 'opendaylight_v2'], 'ml2')
         cfg.CONF.set_override('port_binding_controller',
@@ -92,23 +93,29 @@ class OpenDayLightMechanismConfigTests(testlib_api.SqlTestCase):
         self._test_missing_config(password=None)
 
 
+class _OpenDaylightMechanismBase(base_v2.OpenDaylightTestCase):
+    def setUp(self):
+        self.useFixture(base.OpenDaylightPseudoAgentPrePopulateFixture())
+        super(_OpenDaylightMechanismBase, self).setUp()
+
+
 class OpenDaylightMechanismTestBasicGet(test_plugin.TestMl2BasicGet,
-                                        base_v2.OpenDaylightTestCase):
+                                        _OpenDaylightMechanismBase):
     pass
 
 
 class OpenDaylightMechanismTestNetworksV2(test_plugin.TestMl2NetworksV2,
-                                          base_v2.OpenDaylightTestCase):
+                                          _OpenDaylightMechanismBase):
     pass
 
 
 class OpenDaylightMechanismTestSubnetsV2(test_plugin.TestMl2SubnetsV2,
-                                         base_v2.OpenDaylightTestCase):
+                                         _OpenDaylightMechanismBase):
     pass
 
 
 class OpenDaylightMechanismTestPortsV2(test_plugin.TestMl2PortsV2,
-                                       base_v2.OpenDaylightTestCase):
+                                       _OpenDaylightMechanismBase):
     pass
 
 
@@ -152,6 +159,7 @@ class OpenDaylightMechanismDriverTestCase(base_v2.OpenDaylightConfigBase):
     def setUp(self):
         self.useFixture(base.OpenDaylightFeaturesFixture())
         self.useFixture(base.OpenDaylightJournalThreadFixture())
+        self.useFixture(base.OpenDaylightPseudoAgentPrePopulateFixture())
         super(OpenDaylightMechanismDriverTestCase, self).setUp()
         self.mech = mech_driver_v2.OpenDaylightMechanismDriver()
         self.mech.initialize()
@@ -314,6 +322,12 @@ class OpenDaylightMechanismDriverTestCase(base_v2.OpenDaylightConfigBase):
                             security_group={'security_group_rules':
                                             {'id': SG_RULE_FAKE_ID}},
                             security_group_rule_ids=[SG_RULE_FAKE_ID])
+            elif (object_type == odl_const.ODL_SG_RULE and
+                  operation == odl_const.ODL_DELETE):
+                with self.db_session.begin(subtransactions=True):
+                    self.mech.sync_from_callback_precommit(
+                        plugin_context, operation, res_type, res_id,
+                        context_, security_group_id=SG_FAKE_ID)
             else:
                 with self.db_session.begin(subtransactions=True):
                     self.mech.sync_from_callback_precommit(
@@ -616,6 +630,24 @@ class OpenDaylightMechanismDriverTestCase(base_v2.OpenDaylightConfigBase):
                             'tenant_id': 'test-tenant',
                             'id': SG_FAKE_ID, 'name': 'test_sg'})])
 
+    def test_sg_rule_delete(self):
+        with mock.patch.object(journal, 'record') as record:
+            context = self._get_mock_operation_context(odl_const.ODL_SG_RULE)
+            res_id = context[odl_const.ODL_SG_RULE]['id']
+            rule = mock.Mock()
+            rule.id = SG_RULE_FAKE_ID
+            rule.security_group_id = SG_FAKE_ID
+            kwargs = {'security_group_rule_id': SG_RULE_FAKE_ID,
+                      'security_group_id': SG_FAKE_ID}
+            with self.db_session.begin(subtransactions=True):
+                self.mech.sync_from_callback_precommit(
+                    self.db_context, odl_const.ODL_DELETE,
+                    callback._RESOURCE_MAPPING[odl_const.ODL_SG_RULE],
+                    res_id, context, **kwargs)
+            record.assert_has_calls(
+                [mock.call(mock.ANY, 'security_group_rule',
+                           SG_RULE_FAKE_ID, 'delete', [SG_FAKE_ID])])
+
     def test_sync_multiple_updates(self):
         # add 2 updates
         for i in range(2):
@@ -664,7 +696,7 @@ class OpenDaylightMechanismDriverTestCase(base_v2.OpenDaylightConfigBase):
                     self.assertEqual(port[key], value)
 
 
-class _OpenDaylightDriverVlanTransparencyBase(base_v2.OpenDaylightTestCase):
+class _OpenDaylightDriverVlanTransparencyBase(_OpenDaylightMechanismBase):
     def _driver_context(self, network):
         return mock.MagicMock(current=network)
 

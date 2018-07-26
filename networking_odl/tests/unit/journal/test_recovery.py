@@ -14,6 +14,8 @@
 #  under the License.
 #
 
+from oslo_config import cfg
+
 import mock
 
 from neutron_lib import exceptions as nexc
@@ -91,6 +93,15 @@ class RecoveryTestCase(test_base_db.ODLBaseDbTestCase):
             nexc.NotFound, recovery._get_latest_resource,
             self.db_context.session, mock_row)
 
+    def test_journal_recovery_retries_exceptions(self):
+        db.create_pending_row(self.db_context.session, odl_const.ODL_NETWORK,
+                              'id', odl_const.ODL_DELETE, {})
+        created_row = db.get_all_db_rows(self.db_context.session)[0]
+        db.update_db_row_state(self.db_context.session, created_row,
+                               odl_const.FAILED)
+        with mock.patch.object(db, 'update_db_row_state') as m:
+            self._test_retry_exceptions(recovery.journal_recovery, m, True)
+
     def test_journal_recovery_no_rows(self):
         recovery.journal_recovery(self.db_context)
         self.assertFalse(self._CLIENT.get_resource.called)
@@ -106,21 +117,41 @@ class RecoveryTestCase(test_base_db.ODLBaseDbTestCase):
 
         recovery.journal_recovery(self.db_context)
 
-        row = db.get_all_db_rows_by_state(self.db_context.session,
-                                          expected_state)[0]
-        self.assertEqual(created_row['seqnum'], row['seqnum'])
+        if expected_state is None:
+            completed_rows = db.get_all_db_rows_by_state(
+                self.db_context.session, odl_const.COMPLETED)
+            self.assertEqual([], completed_rows)
+        else:
+            row = db.get_all_db_rows_by_state(self.db_context.session,
+                                              expected_state)[0]
+            self.assertEqual(created_row['seqnum'], row['seqnum'])
+
         return created_row
 
-    def test_journal_recovery_hadles_failure_quietly(self):
-        self._CLIENT.get_resource.side_effect = Exception('')
+    def _disable_retention(self):
+        cfg.CONF.set_override('completed_rows_retention', 0, 'ml2_odl')
+
+    def test_journal_recovery_handles_failure_quietly(self):
+        class TestException(Exception):
+            pass
+
+        self._CLIENT.get_resource.side_effect = TestException('')
         self._test_recovery(
             odl_const.ODL_DELETE, None, odl_const.FAILED)
 
     def test_journal_recovery_deleted_row_not_in_odl(self):
         self._test_recovery(odl_const.ODL_DELETE, None, odl_const.COMPLETED)
 
+    def test_journal_recovery_deleted_row_not_in_odl_purged(self):
+        self._disable_retention()
+        self._test_recovery(odl_const.ODL_DELETE, None, None)
+
     def test_journal_recovery_created_row_exists_in_odl(self):
         self._test_recovery(odl_const.ODL_CREATE, {}, odl_const.COMPLETED)
+
+    def test_journal_recovery_created_row_exists_in_odl_purged(self):
+        self._disable_retention()
+        self._test_recovery(odl_const.ODL_CREATE, {}, None)
 
     def test_journal_recovery_deleted_row_exists_in_odl(self):
         self._test_recovery(odl_const.ODL_DELETE, {}, odl_const.PENDING)
@@ -162,6 +193,20 @@ class RecoveryTestCase(test_base_db.ODLBaseDbTestCase):
         self._test_recovery(odl_const.ODL_CREATE, None, odl_const.COMPLETED)
 
     @mock.patch.object(recovery, '_get_latest_resource')
+    def test_recovery_created_resource_missing_and_not_in_odl_purged(
+            self, rmock):
+        rmock.side_effect = nexc.NotFound
+        self._disable_retention()
+        self._test_recovery(odl_const.ODL_CREATE, None, None)
+
+    @mock.patch.object(recovery, '_get_latest_resource')
     def test_recovery_updated_resource_missing_and_not_in_odl(self, rmock):
         rmock.side_effect = nexc.NotFound
         self._test_recovery(odl_const.ODL_UPDATE, None, odl_const.COMPLETED)
+
+    @mock.patch.object(recovery, '_get_latest_resource')
+    def test_recovery_updated_resource_missing_and_not_in_odl_purged(
+            self, rmock):
+        rmock.side_effect = nexc.NotFound
+        self._disable_retention()
+        self._test_recovery(odl_const.ODL_UPDATE, None, None)

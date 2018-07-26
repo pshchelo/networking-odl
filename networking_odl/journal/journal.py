@@ -17,11 +17,13 @@ import copy
 import threading
 import time
 
+from neutron.db import api as db_api
 from neutron_lib.callbacks import registry
 from neutron_lib import context as nl_context
 from neutron_lib.plugins import directory
 from neutron_lib import worker
 from oslo_config import cfg
+from oslo_db import exception
 from oslo_log import log as logging
 from oslo_service import loopingcall
 from requests import exceptions
@@ -37,6 +39,12 @@ from networking_odl.journal import dependency_validations
 LOG = logging.getLogger(__name__)
 
 MAKE_URL = {}
+LOG_ENTRY_TEMPLATE = ("%(log_type)s (Entry ID: %(entry_id)s) - %(op)s "
+                      "%(obj_type)s %(obj_id)s")
+LOG_RECORDED = 'Recorded'
+LOG_PROCESSING = 'Processing'
+LOG_COMPLETED = 'Completed'
+LOG_ERROR_PROCESSING = 'Error while processing'
 
 
 def call_thread_on_end(func):
@@ -83,6 +91,13 @@ def _enrich_port(plugin_context, ml2_context, object_type, operation, data):
     return new_data
 
 
+def _log_entry(log_type, entry, log_level=logging.INFO, **kwargs):
+    log_dict = {'log_type': log_type, 'op': entry.operation,
+                'obj_type': entry.object_type, 'obj_id': entry.object_uuid,
+                'entry_id': entry.seqnum}
+    LOG.log(log_level, LOG_ENTRY_TEMPLATE, log_dict, **kwargs)
+
+
 def record(plugin_context, object_type, object_uuid, operation, data,
            ml2_context=None):
     if (object_type == odl_const.ODL_PORT and
@@ -93,8 +108,48 @@ def record(plugin_context, object_type, object_uuid, operation, data,
     # Calculate depending_on on other journal entries
     depending_on = dependency_validations.calculate(
         plugin_context.session, operation, object_type, object_uuid, data)
-    db.create_pending_row(plugin_context.session, object_type, object_uuid,
-                          operation, data, depending_on=depending_on)
+
+    # NOTE(mpeterson): Between the moment that a dependency is calculated and
+    # the new entry is recorded in the journal, an operation can ocurr that
+    # would make the dependency irrelevant. In that case we request a retry.
+    # For more details, read the commit message that introduced this comment.
+    try:
+        entry = db.create_pending_row(
+            plugin_context.session, object_type, object_uuid, operation, data,
+            depending_on=depending_on)
+    except exception.DBReferenceError as e:
+        raise exception.RetryRequest(e)
+
+    _log_entry(LOG_RECORDED, entry)
+    LOG.debug('Entry with ID %(entry_id)s depends on these entries: '
+              '%(depending_on)s',
+              {'entry_id': entry.seqnum,
+               'depending_on': [d.seqnum for d in depending_on]})
+
+
+@db_api.retry_if_session_inactive()
+def entry_complete(context, entry):
+    session = context.session
+    with db_api.autonested_transaction(session):
+        if cfg.CONF.ml2_odl.completed_rows_retention == 0:
+            db.delete_row(session, entry)
+        else:
+            db.update_db_row_state(session, entry, odl_const.COMPLETED)
+            db.delete_dependency(session, entry)
+
+
+@db_api.retry_if_session_inactive()
+def entry_reset(context, entry):
+    session = context.session
+    with db_api.autonested_transaction(session):
+        db.update_db_row_state(session, entry, odl_const.PENDING)
+
+
+@db_api.retry_if_session_inactive()
+def entry_update_state_by_retry_count(context, entry, retry_count):
+    session = context.session
+    with db_api.autonested_transaction(session):
+        db.update_pending_db_row_retry(session, entry, retry_count)
 
 
 def _make_url(row):
@@ -235,33 +290,29 @@ class OpenDaylightJournalThread(object):
         self._sleep_time = self._RETRY_SLEEP_MIN
 
     def _sync_entry(self, context, entry):
-        log_dict = {'op': entry.operation, 'type': entry.object_type,
-                    'id': entry.object_uuid}
-        LOG.info("Processing - %(op)s %(type)s %(id)s", log_dict)
+        _log_entry(LOG_PROCESSING, entry)
         method, urlpath, to_send = self._json_data(entry)
 
-        session = context.session
+        # TODO(mkolesni): This logic is weirdly written, need to refactor it.
         try:
             self.client.sendjson(method, urlpath, to_send)
             registry.notify(entry.object_type, odl_const.BEFORE_COMPLETE,
                             self, context=context, operation=entry.operation,
                             row=entry)
-            with session.begin():
-                db.update_db_row_state(session, entry, odl_const.COMPLETED)
-                db.delete_dependency(session, entry)
-                self._retry_reset()
+            entry_complete(context, entry)
+            self._retry_reset()
+            _log_entry(LOG_COMPLETED, entry)
         except exceptions.ConnectionError:
             # Don't raise the retry count, just log an error & break
-            db.update_db_row_state(session, entry, odl_const.PENDING)
+            entry_reset(context, entry)
             LOG.error("Cannot connect to the OpenDaylight Controller,"
                       " will not process additional entries")
             self._retry_sleep()
             return True
         except Exception:
-            LOG.error("Error while processing %(op)s %(type)s %(id)s",
-                      log_dict, exc_info=True)
-            db.update_pending_db_row_retry(
-                session, entry, self._max_retry_count)
-            self._retry_sleep()
+            _log_entry(LOG_ERROR_PROCESSING, entry,
+                       log_level=logging.ERROR, exc_info=True)
+            entry_update_state_by_retry_count(
+                context, entry, self._max_retry_count)
 
         return False
