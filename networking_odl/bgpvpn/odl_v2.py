@@ -79,7 +79,7 @@ class OpenDaylightBgpvpnDriver(driver_api.BGPVPNDriver):
                        bgpvpn['id'], odl_const.ODL_CREATE, bgpvpn)
 
     @log_helpers.log_method_call
-    def update_bgpvpn_precommit(self, context, bgpvpn):
+    def update_bgpvpn_precommit(self, context, old_bgpvpn, bgpvpn):
         journal.record(context, odl_const.ODL_BGPVPN,
                        bgpvpn['id'], odl_const.ODL_UPDATE, bgpvpn)
 

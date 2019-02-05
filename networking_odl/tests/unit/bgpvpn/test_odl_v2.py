@@ -14,6 +14,8 @@
 #  under the License.
 #
 
+import copy
+
 import mock
 
 from networking_odl.bgpvpn import odl_v2 as driverv2
@@ -42,6 +44,14 @@ class OpenDaylightBgpvpnDriverTestCase(base_v2.OpenDaylightConfigBase):
                        'routers': router_id}
         return fake_bgpvpn
 
+    def _add_rd(self, bgpvpn, rd):
+        bgpvpn['route_distinguishers'].append(rd)
+        return bgpvpn
+
+    def _delete_rd(self, bgpvpn, rd):
+        bgpvpn['route_distinguishers'].remove(rd)
+        return bgpvpn
+
     def _get_fake_router_assoc(self):
         fake_router_assoc = {'id': 'ROUTER_ASSOC_ID',
                              'bgpvpn_id': 'BGPVPN_ID',
@@ -54,7 +64,8 @@ class OpenDaylightBgpvpnDriverTestCase(base_v2.OpenDaylightConfigBase):
                           'network_id': 'NET_ID'}
         return fake_net_assoc
 
-    def _assert_op(self, operation, object_type, data, precommit=True):
+    def _assert_op_with_id(self, operation, object_type, data,
+                           precommit=True):
         rows = sorted(db.get_all_db_rows_by_state(self.db_session,
                                                   odl_const.PENDING),
                       key=lambda x: x.seqnum)
@@ -63,6 +74,18 @@ class OpenDaylightBgpvpnDriverTestCase(base_v2.OpenDaylightConfigBase):
             self.assertEqual(operation, rows[0]['operation'])
             self.assertEqual(object_type, rows[0]['object_type'])
             self.assertEqual(data['id'], rows[0]['object_uuid'])
+        else:
+            self.assertEqual([], rows)
+
+    def _assert_op(self, operation, object_type, data, precommit=True):
+        rows = sorted(db.get_all_db_rows_by_state(self.db_session,
+                                                  odl_const.PENDING),
+                      key=lambda x: x.seqnum)
+        if precommit:
+            self.db_session.flush()
+            self.assertEqual(operation, rows[0]['operation'])
+            self.assertEqual(object_type, rows[0]['object_type'])
+            self.assertEqual(data, rows[0]['data'])
         else:
             self.assertEqual([], rows)
 
@@ -77,21 +100,34 @@ class OpenDaylightBgpvpnDriverTestCase(base_v2.OpenDaylightConfigBase):
 
     def test_update_bgpvpn(self):
         fake_data = self._get_fake_bgpvpn()
-        self.driver.update_bgpvpn_precommit(self.db_context, fake_data)
+        fake_data_copy = copy.deepcopy(fake_data)
+        fake_updated_data1 = self._add_rd(fake_data_copy, '100:2')
+        self.driver.update_bgpvpn_precommit(self.db_context, fake_data,
+                                            fake_updated_data1)
         self._assert_op(odl_const.ODL_UPDATE, odl_const.ODL_BGPVPN,
-                        fake_data)
+                        fake_updated_data1)
         self.run_journal_processing()
         self._assert_op(odl_const.ODL_UPDATE, odl_const.ODL_BGPVPN,
-                        fake_data, False)
+                        fake_updated_data1, False)
+        fake_updated_data1_copy = copy.deepcopy(fake_updated_data1)
+        fake_updated_data2 = self._delete_rd(fake_updated_data1_copy, '100:1')
+        self.driver.update_bgpvpn_precommit(self.db_context,
+                                            fake_updated_data1,
+                                            fake_updated_data2)
+        self._assert_op(odl_const.ODL_UPDATE, odl_const.ODL_BGPVPN,
+                        fake_updated_data2)
+        self.run_journal_processing()
+        self._assert_op(odl_const.ODL_UPDATE, odl_const.ODL_BGPVPN,
+                        fake_updated_data2, False)
 
     def test_delete_bgpvpn(self):
         fake_data = self._get_fake_bgpvpn()
         self.driver.delete_bgpvpn_precommit(self.db_context, fake_data)
-        self._assert_op(odl_const.ODL_DELETE, odl_const.ODL_BGPVPN,
-                        fake_data)
+        self._assert_op_with_id(odl_const.ODL_DELETE, odl_const.ODL_BGPVPN,
+                                fake_data)
         self.run_journal_processing()
-        self._assert_op(odl_const.ODL_DELETE, odl_const.ODL_BGPVPN,
-                        fake_data, False)
+        self._assert_op_with_id(odl_const.ODL_DELETE, odl_const.ODL_BGPVPN,
+                                fake_data, False)
 
     def test_create_router_assoc(self):
         fake_rtr_assoc_data = self._get_fake_router_assoc()
