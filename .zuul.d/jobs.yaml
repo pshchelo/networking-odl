@@ -1,4 +1,69 @@
-# >>> LEGACY JOBS TO REPLACE AND ADJUST NAMING
+- job:
+    name: networking-odl-config-job
+    description: Fake job to hold configuration settings for jobs
+    vars:
+      odl_version_map:
+        oxygen: &oxygen oxygen-latest
+        fluorine: &fluorine fluorine-snapshot-0.9
+      common_devstack_vars: &devstack_vars
+        devstack_localrc:
+          ODL_TIMEOUT: 60
+          ODL_RELEASE: latest-snapshot
+          # Set here which ODL openstack service provider to use
+          ODL_NETVIRT_KARAF_FEATURE: odl-neutron-service,odl-restconf-all,odl-aaa-authn,odl-dlux-core,odl-mdsal-apidocs,odl-netvirt-openstack,odl-neutron-logger,odl-neutron-hostconfig-ovs
+          # Switch to using the ODL's L3 implementation
+          ODL_L3: True
+          # public network connectivity
+          ODL_PROVIDER_MAPPINGS: public:br-ex
+          PUBLIC_PHYSICAL_NETWORK: public
+          PUBLIC_BRIDGE: br-ex
+          Q_USE_PUBLIC_VETH: False
+          # Enable debug logs for odl ovsdb
+          ODL_NETVIRT_DEBUG_LOGS: True
+          # Database
+          MYSQL_PASSWORD: secretmysql
+          DATABASE_QUERY_LOGGING: True
+          OS_LOG_PATH: '{{ zuul.executor.log_root }}'
+          IS_GATE: True
+        devstack_services: &devstack_services
+          c-api: True
+          c-bak: True
+          c-sch: True
+          c-vol: True
+          cinder: True
+          dstat: True
+          g-api: True
+          g-reg: True
+          horizon: False
+          key: True
+          mysql: True
+          n-api-meta: True
+          n-api: True
+          n-cauth: False
+          n-cond: True
+          n-cpu: True
+          n-crt: True
+          n-novnc: False
+          n-obj: True
+          n-sch: True
+          neutron: True
+          neutron-agent: False
+          neutron-api: True
+          neutron-dhcp: True
+          neutron-l3: False
+          neutron-metadata-agent: True
+          neutron-qos: True
+          placement-api: True
+          placement-client: False
+          q-agt: False
+          q-dhcp: False
+          q-l3: False
+          q-meta: False
+          q-svc: False
+          rabbit: True
+        devstack_plugins: &devstack_plugins
+          networking-odl: git://git.openstack.org/openstack/networking-odl
+          neutron: git://git.openstack.org/openstack/neutron
 
 - job:
     name: networking-odl-grenade-dsvm
